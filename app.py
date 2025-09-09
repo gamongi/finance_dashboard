@@ -1,256 +1,259 @@
-# app.py
-
 import streamlit as st
-import polars as pl
 import yfinance as yf
-from requests_html import HTMLSession
-import plotly.graph_objects as go
-from github import Github, UnknownObjectException
-import json
+import polars as pl
+from streamlit_lottie import st_lottie
+import requests
 
-# --- 페이지 설정 및 UI 커스텀 CSS ---
-st.set_page_config(page_title="Stock Dashboard", page_icon="📊", layout="wide")
+# --------------------------------------------------------------------------------
+# 1. 페이지 설정 (Page Config)
+# --------------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Fox Stock Dashboard",
+    page_icon="🦊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.markdown("""
-<style>
-/* 전체 앱의 여백을 줄여 공간 활용도 높임 */
-.block-container {
-    padding-top: 2rem;
-    padding-bottom: 2rem;
-    padding-left: 3rem;
-    padding-right: 3rem;
-}
-/* 사이드바 즐겨찾기 버튼 스타일 */
-div[data-testid="stSidebarNav"] + div div[data-testid="stButton"] > button {
-    border: none; background-color: transparent; text-align: left;
-    padding-left: 0; color: inherit; font-size: 1.1em;
-}
-div[data-testid="stSidebarNav"] + div div[data-testid="stButton"] > button:hover {
-    color: #FF4B4B; background-color: transparent;
-}
-/* 검색창 Form 배경 투명화 */
-form[data-testid="stForm"] {
-    background: transparent;
-    border: none;
-    padding: 0;
-}
-/* 검색창 입력 필드 스타일 */
-div[data-testid="stTextInput"] > div > div > input {
-    background-color: rgba(230, 230, 230, 0.5); /* 반투명 회색 */
-    border: none;
-}
-/* 메인 헤더의 가격/등락률 스타일 */
-.stock-price { font-size: 2em; font-weight: bold; }
-.stock-delta-positive { font-size: 1.2em; color: #FF4B4B; }
-.stock-delta-negative { font-size: 1.2em; color: #4B9BFF; }
-</style>
-""", unsafe_allow_html=True)
-
-# --- GitHub 연동 및 데이터 로딩/처리 함수들 (이전과 거의 동일) ---
-FAVORITES_FILE_PATH = "favorites.json"
-
-try:
-    g = Github(st.secrets["GITHUB_TOKEN"])
-    repo = g.get_repo(st.secrets["GITHUB_REPO"])
-except Exception as e:
-    st.sidebar.error("GitHub 인증 실패. Secrets를 확인하세요.")
-    st.stop()
-
-@st.cache_data(ttl=60)
-def read_favorites_from_github():
-    try:
-        content = repo.get_contents(FAVORITES_FILE_PATH)
-        return json.loads(content.decoded_content.decode())
-    except UnknownObjectException:
-        return ["MSFT", "AAPL", "GOOG", "NVDA"]
-    except Exception as e:
-        st.sidebar.error(f"즐겨찾기 로딩 실패: {e}")
-        return []
-
-def write_favorites_to_github(favorites_list):
-    try:
-        contents = json.dumps(sorted(list(set(favorites_list))), indent=4)
-        try:
-            file = repo.get_contents(FAVORITES_FILE_PATH)
-            repo.update_file(FAVORITES_FILE_PATH, "Update favorites", contents, file.sha)
-        except UnknownObjectException:
-            repo.create_file(FAVORITES_FILE_PATH, "Create favorites", contents)
-        st.cache_data.clear()
-        return True
-    except Exception as e:
-        st.error(f"즐겨찾기 저장 실패: {e}")
-        return False
-
-@st.cache_data(ttl=600)
-def fetch_full_data(ticker_symbol):
+# --------------------------------------------------------------------------------
+# 2. 데이터 로드 및 캐싱 함수
+# --------------------------------------------------------------------------------
+@st.cache_data(ttl=3600) # 1시간 동안 캐시 유지
+def get_ticker_data(ticker_symbol):
+    """yfinance를 사용하여 주식 데이터를 가져오고 캐싱하는 함수"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.info
-        # CAGR(5y) 계산을 위해 6년치 데이터 로딩
-        hist_pd = ticker.history(period="6y", interval="1d")
-        if hist_pd.empty: return None
-        financials = ticker.financials
-        return {"info": info, "history": hist_pd, "financials": financials}
+        hist = ticker.history(period="2d") # 현재가 및 전일비 계산을 위해 2일치 데이터 요청
+
+        if hist.empty or len(hist) < 2:
+            return None # 데이터가 부족하면 None 반환
+
+        # 필요한 데이터 추출
+        data = {
+            "longName": info.get("longName", ticker_symbol),
+            "currentPrice": hist['Close'].iloc[-1],
+            "previousClose": hist['Close'].iloc[-2],
+            "marketCap": info.get("marketCap"),
+            "trailingPE": info.get("trailingPE"),
+            "forwardPE": info.get("forwardPE"),
+            "priceToBook": info.get("priceToBook"),
+            "dividendYield": info.get("dividendYield"),
+            "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
+            "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
+        }
+        return data
     except Exception as e:
-        st.error(f"데이터 로딩 중 오류 발생: {e}")
+        # st.error(f"Error fetching data for {ticker_symbol}: {e}")
         return None
 
-def process_data(full_data):
-    hist_pl = pl.from_pandas(full_data["history"].reset_index())
-    hist_pl = hist_pl.with_columns([
-        pl.col("Close").rolling_mean(window_size=50).alias("MA50"),
-        pl.col("Close").rolling_mean(window_size=200).alias("MA200"),
-    ]).drop_nulls()
-    view_data = hist_pl.tail(252)
-    max_point = view_data.filter(pl.col("High") == view_data["High"].max())
-    min_point = view_data.filter(pl.col("Low") == view_data["Low"].min())
-    cross_signal = pl.when(pl.col("MA50") > pl.col("MA200")).then(1).otherwise(-1)
-    cross_events = view_data.with_columns(cross_signal.diff().alias("cross")).filter(pl.col("cross") != 0)
-    financials_pl = pl.from_pandas(full_data["financials"].transpose().reset_index())
-    cagr = {}
-    for col_name_eng, col_name_kor in [("Total Revenue", "매출"), ("Net Income", "순이익")]:
-        if col_name_eng in financials_pl.columns and financials_pl[col_name_eng].drop_nulls().len() > 1:
-            series = financials_pl[col_name_eng].drop_nulls()
-            start_val = series.last()
-            end_val = series.first()
-            if start_val and end_val and start_val > 0:
-                num_years = series.len() - 1
-                if num_years > 0:
-                    cagr_val = ((end_val / start_val) ** (1 / num_years)) - 1
-                    cagr[col_name_kor] = f"{cagr_val:.2%}"
-    return {"history": view_data, "max_point": max_point, "min_point": min_point, "cross_events": cross_events, "cagr": cagr}
+# --------------------------------------------------------------------------------
+# 3. Lottie 애니메이션 로드 함수
+# --------------------------------------------------------------------------------
+def load_lottieurl(url: str):
+    r = requests.get(url)
+    if r.status_code != 200:
+        return None
+    return r.json()
 
-@st.cache_data(ttl=600)
-def scrape_finviz_data(ticker_symbol):
-    try:
-        session = HTMLSession()
-        url = f"https://finviz.com/quote.ashx?t={ticker_symbol}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = session.get(url, headers=headers)
-        snapshot_data = r.html.find('td.snapshot-td2')
-        data_map = {snapshot_data[i].text: snapshot_data[i+1].text for i in range(0, len(snapshot_data), 2)}
-        metrics_to_get = ["P/E", "PEG"]
-        metrics = {name: data_map.get(name, "N/A") for name in metrics_to_get}
-        
-        # RSI는 yfinance 데이터로 직접 계산
-        hist = yf.Ticker(ticker_symbol).history(period="1mo")
-        delta = hist['Close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.ewm(com=13, adjust=False).mean()
-        avg_loss = loss.ewm(com=13, adjust=False).mean()
-        rs = avg_gain / avg_loss
-        metrics['RSI'] = 100 - (100 / (1 + rs)).iloc[-1]
-        
-        return metrics
-    except Exception:
-        return {name: "Error" for name in ["P/E", "PEG", "RSI"]}
+lottie_url = "https://lottie.host/b3644a2c-19b8-40b9-9a84-bee9b8a32c52/tN9g32Ea5l.json"
+lottie_json = load_lottieurl(lottie_url)
 
-# --- UI 렌더링 시작 ---
+# --------------------------------------------------------------------------------
+# 4. CSS 스타일링 (Figma 디자인 및 기능 개선 기반)
+# --------------------------------------------------------------------------------
+st.markdown("""
+<style>
+    /* Streamlit 기본 요소 숨기기 */
+    .stDeployButton, #stDecoration { display: none; }
 
-# 1. 사이드바 (즐겨찾기 내비게이션)
+    /* 헤더 스타일 */
+    .header-container {
+        display: flex;
+        align-items: center;
+        gap: 15px; /* 요소 사이의 간격 */
+    }
+    .stock-name { font-size: 28px; font-weight: bold; }
+    .stock-ticker { font-size: 20px; color: #888; margin-left: 8px; }
+    .stock-price { font-size: 28px; font-weight: bold; }
+    .stock-change-positive { font-size: 18px; color: #4CAF50; /* 초록색 */ }
+    .stock-change-negative { font-size: 18px; color: #F44336; /* 빨간색 */ }
+
+    /* 즐겨찾기 별 버튼 스타일 */
+    .stButton > button {
+        background-color: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+        font-size: 28px;
+        color: #FFCA28; /* 노란색 */
+    }
+    .stButton > button:hover {
+        opacity: 0.7;
+    }
+
+    /* 사이드바 버튼 (텍스트 스타일) */
+    .st-emotion-cache-16txtl3 h2 { font-size: 20px; font-weight: bold; margin-bottom: 1rem; }
+    .st-emotion-cache-16txtl3 .stButton > button {
+        background: transparent;
+        border: none;
+        color: #555;
+        text-align: left;
+        padding: 8px 0;
+        font-size: 16px;
+        width: 100%;
+        transition: color 0.2s;
+    }
+    .st-emotion-cache-16txtl3 .stButton > button:hover {
+        color: #FF4B4B;
+    }
+    /* 선택된 항목 스타일은 Python에서 st.markdown으로 직접 적용 */
+    .selected-watchlist-item {
+        padding: 8px 0;
+        font-size: 16px;
+        font-weight: bold;
+        color: #FF4B4B;
+    }
+
+    /* 검색창 스타일 */
+    .stTextInput > div > div > input {
+        background-color: #F0F2F6; border: none; border-radius: 10px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------------
+# 5. 세션 상태 초기화 (Session State)
+# --------------------------------------------------------------------------------
+if 'ticker' not in st.session_state:
+    st.session_state.ticker = 'AAPL'
 if 'favorites' not in st.session_state:
-    st.session_state.favorites = read_favorites_from_github()
-for fav_ticker in st.session_state.favorites:
-    if st.sidebar.button(fav_ticker, key=f"fav_{fav_ticker}"):
-        st.session_state.ticker_to_search = fav_ticker
-        st.session_state.run_search = True
+    st.session_state.favorites = ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA']
 
-# 2. 전역 검색창 (최상단 우측)
-_, search_col = st.columns([0.7, 0.3])
-with search_col:
-    with st.form(key="search_form"):
-        ticker_input = st.text_input("Search", label_visibility="collapsed", placeholder="종목 검색...")
-        run_button = st.form_submit_button("🔍")
+# --------------------------------------------------------------------------------
+# 6. 사이드바 구현 (Sidebar)
+# --------------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("<h2>My Watchlist</h2>", unsafe_allow_html=True)
 
-if run_button:
-    st.session_state.ticker_to_search = ticker_input
-    st.session_state.run_search = True
+    # 즐겨찾기 목록 표시
+    for fav_ticker in st.session_state.favorites:
+        # 현재 선택된 티커는 강조된 텍스트로 표시
+        if fav_ticker == st.session_state.ticker:
+            st.markdown(f'<p class="selected-watchlist-item">{fav_ticker}</p>', unsafe_allow_html=True)
+        else:
+            # 나머지는 버튼으로 만들어 클릭 가능하게 함
+            if st.button(fav_ticker, key=f"fav_{fav_ticker}"):
+                st.session_state.ticker = fav_ticker
+                st.rerun()
 
-# 3. 분석 실행 로직
-if "ticker_to_search" not in st.session_state:
-    st.session_state.ticker_to_search = "MSFT"
-if "run_search" not in st.session_state:
-    st.session_state.run_search = True
+# --------------------------------------------------------------------------------
+# 7. 메인 화면 구현 (Main Content)
+# --------------------------------------------------------------------------------
 
-if st.session_state.get("run_search", False):
-    ticker = st.session_state.ticker_to_search
-    full_data = fetch_full_data(ticker)
-    
-    if full_data and not full_data["history"].empty:
-        processed_data = process_data(full_data)
-        finviz_data = scrape_finviz_data(ticker)
-        
-        # 4. 동적 헤더
-        info = full_data["info"]
-        price_info = full_data["history"].iloc[-1]
-        price = price_info['Close']
-        delta = price - full_data["history"].iloc[-2]['Close']
-        delta_pct = (delta / full_data["history"].iloc[-2]['Close']) * 100
-        delta_color = "positive" if delta >= 0 else "negative"
+# --- 7.1. 데이터 가져오기 ---
+data = get_ticker_data(st.session_state.ticker)
 
-        name_col, price_col, star_col = st.columns([0.6, 0.3, 0.1])
-        with name_col:
-            st.markdown(f"""
-            <span style="font-size: 2.2em; font-weight: bold;">{info.get('longName', ticker)}</span>
-            <span style="font-size: 1.2em; color: grey;">{ticker}</span>
-            """, unsafe_allow_html=True)
-        with price_col:
-            st.markdown(f"""
-            <span class="stock-price">${price:,.2f}</span>
-            <span class="stock-delta-{delta_color}">({delta:+.2f} / {delta_pct:+.2f}%)</span>
-            """, unsafe_allow_html=True)
-        with star_col:
-            is_favorite = ticker in st.session_state.favorites
-            star_icon = "⭐" if is_favorite else "★"
-            if st.button(star_icon, key="fav_toggle"):
-                if is_favorite: st.session_state.favorites.remove(ticker)
-                else: st.session_state.favorites.append(ticker)
-                if write_favorites_to_github(st.session_state.favorites): st.rerun()
+if not data:
+    st.error(f"'{st.session_state.ticker}'에 대한 데이터를 가져올 수 없습니다. 티커를 확인해주세요.")
+    st.stop()
 
-        st.markdown("---")
+# --- 7.2. 헤더 (Header) ---
+header_cols = st.columns([0.8, 5, 2]) # [별+로티], [주식정보], [검색창]
 
-        # 5. 메인 컨텐츠 (차트 + 지표)
-        chart_col, metrics_col = st.columns([0.7, 0.3])
-        with chart_col:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=processed_data["history"]["Date"], y=processed_data["history"]["Close"], mode='lines', name='종가', line=dict(width=3)))
-            fig.add_trace(go.Scatter(x=processed_data["history"]["Date"], y=processed_data["history"]["MA50"], mode='lines', name='MA50', line=dict(color='orange', width=1.5)))
-            fig.add_trace(go.Scatter(x=processed_data["history"]["Date"], y=processed_data["history"]["MA200"], mode='lines', name='MA200', line=dict(color='purple', width=1.5)))
-            fig.add_trace(go.Scatter(x=processed_data["max_point"]["Date"], y=processed_data["max_point"]["High"], mode='markers', name='최고점', marker=dict(color='green', size=10, symbol='triangle-up'), hovertemplate='최고가: %{y:.2f}<br>%{x}'))
-            fig.add_trace(go.Scatter(x=processed_data["min_point"]["Date"], y=processed_data["min_point"]["Low"], mode='markers', name='최저점', marker=dict(color='red', size=10, symbol='triangle-down'), hovertemplate='최저가: %{y:.2f}<br>%{x}'))
-            fig.update_layout(height=450, xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-            st.plotly_chart(fig, use_container_width=True)
+with header_cols[0]:
+    # 헤더 컨테이너 시작
+    st.markdown('<div class="header-container">', unsafe_allow_html=True)
 
-        with metrics_col:
-            # CSS Flexbox를 사용하여 지표들을 유연하게 배치
-            metrics_html = "<div style='display: flex; flex-wrap: wrap; gap: 15px; align-items: center; height: 450px;'>"
-            
-            # 지표 데이터와 설명을 리스트로 관리
-            metrics_list = [
-                {"label": "RSI(14)", "value": f"{finviz_data.get('RSI', 0):.2f}", "help": "주가 추세의 강도를 나타내는 모멘텀 지표. 70 이상은 과매수, 30 이하는 과매도 구간으로 해석될 수 있습니다."},
-                {"label": "P/E", "value": finviz_data.get("P/E", "N/A"), "help": "주가수익비율. 주가를 주당순이익으로 나눈 값."},
-                {"label": "PEG", "value": finviz_data.get("PEG", "N/A"), "help": "주가수익성장비율. P/E를 주당순이익 증가율로 나눈 값."},
-                {"label": f"매출 CAGR(5y)", "value": processed_data['cagr'].get('매출', 'N/A'), "help": "최근 5년간의 연평균 매출 성장률."},
-                {"label": f"순이익 CAGR(5y)", "value": processed_data['cagr'].get('순이익', 'N/A'), "help": "최근 5년간의 연평균 순이익 성장률."}
-            ]
-            
-            # 각 지표를 HTML로 생성 (Streamlit의 help 기능을 모방)
-            for m in metrics_list:
-                metrics_html += f"""
-                <div style='flex-grow: 1; min-width: 120px;'>
-                    <span title='{m['help']}' style='font-size: 1.1em; font-weight: bold;'>{m['label']} ❓</span>
-                    <br>
-                    <span style='font-size: 1.5em;'>{m['value']}</span>
-                </div>
-                """
-            metrics_html += "</div>"
-            st.markdown(metrics_html, unsafe_allow_html=True)
+    # 즐겨찾기 버튼 (별)
+    is_favorite = st.session_state.ticker in st.session_state.favorites
+    star_icon = "⭐" if is_favorite else "☆"
+    if st.button(star_icon, key="favorite_btn"):
+        if is_favorite:
+            st.session_state.favorites.remove(st.session_state.ticker)
+        else:
+            st.session_state.favorites.append(st.session_state.ticker)
+        st.rerun()
 
-    else:
-        st.error(f"'{ticker}'에 대한 데이터를 찾을 수 없습니다.")
-    
-    st.session_state.run_search = False
+    # Lottie 애니메이션
+    if lottie_json:
+        st_lottie(lottie_json, speed=1, width=60, height=60, key="lottie_header")
 
-else:
-    st.info("우측 상단의 검색창에 종목 코드를 입력하거나, 사이드바의 즐겨찾기를 클릭하여 분석을 시작하세요.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+with header_cols[1]:
+    # 가격 및 등락률 계산
+    price_change = data['currentPrice'] - data['previousClose']
+    price_change_percent = (price_change / data['previousClose']) * 100
+    change_class = "stock-change-positive" if price_change >= 0 else "stock-change-negative"
+    change_symbol = "+" if price_change >= 0 else ""
+
+    # 헤더 정보 표시
+    st.markdown(f"""
+    <div class="header-container" style="padding-top: 10px;">
+        <span class="stock-name">{data['longName']}</span>
+        <span class="stock-ticker">{st.session_state.ticker}</span>
+        <span class="stock-price">${data['currentPrice']:.2f}</span>
+        <span class="{change_class}">{change_symbol}{price_change:.2f} ({change_symbol}{price_change_percent:.2f}%)</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+with header_cols[2]:
+    # 검색창
+    search_ticker = st.text_input(
+        "Search Ticker", placeholder="Search Ticker...", label_visibility="collapsed"
+    )
+    if search_ticker and search_ticker.upper() != st.session_state.ticker:
+        st.session_state.ticker = search_ticker.upper()
+        st.rerun()
+
+st.markdown("---")
+
+# --- 7.3. 차트 및 주요 지표 영역 ---
+main_cols = st.columns([3, 1.2])
+
+with main_cols[0]:
+    # TradingView 차트
+    tradingview_html = f"""
+    <div style="height: 650px; width: 100%;">
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+      new TradingView.widget({{
+          "autosize": true,
+          "symbol": "{st.session_state.ticker}",
+          "interval": "D",
+          "timezone": "Etc/UTC",
+          "theme": "light",
+          "style": "1",
+          "locale": "en",
+          "enable_publishing": false,
+          "allow_symbol_change": false, /* 심볼 변경 비활성화 */
+          "container_id": "tradingview_widget_container"
+      }});
+      </script>
+      <div id="tradingview_widget_container" style="height: 100%; width: 100%;"></div>
+    </div>
+    """
+    st.components.v1.html(tradingview_html, height=650)
+
+with main_cols[1]:
+    # 주요 지표 (Key Metrics)
+    st.markdown("<h4>Key Metrics</h4>", unsafe_allow_html=True)
+
+    # 숫자 포맷팅 함수
+    def format_market_cap(mc):
+        if mc is None: return "N/A"
+        if mc >= 1e12: return f"${mc/1e12:.2f} T"
+        if mc >= 1e9: return f"${mc/1e9:.2f} B"
+        if mc >= 1e6: return f"${mc/1e6:.2f} M"
+        return f"${mc}"
+
+    # 2x3 그리드로 지표 표시
+    metric_cols = st.columns(2)
+    with metric_cols[0]:
+        st.metric("Market Cap", format_market_cap(data['marketCap']))
+        st.metric("Trailing P/E", f"{data['trailingPE']:.2f}" if data['trailingPE'] else "N/A")
+        st.metric("Dividend Yield", f"{data['dividendYield']*100:.2f}%" if data['dividendYield'] else "N/A")
+    with metric_cols[1]:
+        st.metric("52-Week High", f"${data['fiftyTwoWeekHigh']:.2f}" if data['fiftyTwoWeekHigh'] else "N/A")
+        st.metric("Forward P/E", f"{data['forwardPE']:.2f}" if data['forwardPE'] else "N/A")
+        st.metric("Price-to-Book", f"{data['priceToBook']:.2f}" if data['priceToBook'] else "N/A")
