@@ -6,4 +6,5 @@ plotly
 requests-html
 yfinance
 pandas
-lxml_html_clean # lxml.html.clean ImportError 해결을 위해 추가
+lxml_html_clean
+PyGithub # GitHub API를 편리하게 사용하기 위한 라이브러리
