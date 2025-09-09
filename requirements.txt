@@ -1,0 +1,6 @@
+# requirements.txt
+
+streamlit
+polars
+plotly
+pandas # Plotly 차트를 위해 임시로 필요
