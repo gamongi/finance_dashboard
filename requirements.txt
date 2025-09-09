@@ -3,5 +3,7 @@
 streamlit
 polars
 plotly
-pandas # Plotly 차트를 위해 임시로 필요
-playwright
+requests-html
+yfinance
+pandas
+lxml_html_clean # lxml.html.clean ImportError 해결을 위해 추가
