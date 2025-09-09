@@ -98,10 +98,10 @@ def process_data(full_data):
         pl.col("Close").rolling_mean(window_size=50).alias("MA50"),
         pl.col("Close").rolling_mean(window_size=200).alias("MA200"),
         rsi.alias("RSI")
-    ]).drop_nulls() # MA 계산으로 생긴 null 값 제거
+    ]).drop_nulls()
 
     # 최고/최저점 찾기
-    view_data = hist_pl.tail(252) # 최근 1년치 데이터만으로 최고/최저점 계산
+    view_data = hist_pl.tail(252)
     max_point = view_data.filter(pl.col("High") == view_data["High"].max())
     min_point = view_data.filter(pl.col("Low") == view_data["Low"].min())
 
@@ -115,13 +115,19 @@ def process_data(full_data):
     financials_pl = pl.from_pandas(full_data["financials"].transpose().reset_index())
     cagr = {}
     for col in ["Total Revenue", "Net Income"]:
-        if col in financials_pl.columns:
-            start_val = financials_pl[col].drop_nulls().row(-1)
-            end_val = financials_pl[col].drop_nulls().row(0)
+        if col in financials_pl.columns and financials_pl[col].drop_nulls().len() > 1:
+            # --- 여기가 핵심 수정 부분 ---
+            # yfinance는 최신 데이터를 위쪽에 배치하므로, last()가 가장 오래된 데이터(시작 값)
+            start_val = financials_pl[col].drop_nulls().last() 
+            # first()가 가장 최신 데이터(종료 값)
+            end_val = financials_pl[col].drop_nulls().first()
+            
             if start_val and end_val and start_val > 0:
-                num_years = financials_pl.height -1
-                cagr_val = ((end_val / start_val) ** (1 / num_years)) - 1
-                cagr[col] = f"{cagr_val:.2%}"
+                # drop_nulls()를 했으므로 실제 데이터 길이로 기간 계산
+                num_years = financials_pl[col].drop_nulls().len() - 1
+                if num_years > 0:
+                    cagr_val = ((end_val / start_val) ** (1 / num_years)) - 1
+                    cagr[col] = f"{cagr_val:.2%}"
     
     return {
         "history": view_data,
